@@ -2,11 +2,12 @@ package gofakes3
 
 import (
 	"errors"
-	"github.com/stretchr/testify/assert"
 	"io"
 	"io/ioutil"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestChunkedUploadSuccess(t *testing.T) {
@@ -113,4 +114,23 @@ func TestChunkedUploadFail(t *testing.T) {
 	assert.Equal(t, "", string(buf[:n]))
 	assert.Equal(t, 0, n)
 
+}
+
+func TestChunkedUploadUnsignedTrailer(t *testing.T) {
+	// STREAMING-UNSIGNED-PAYLOAD-TRAILER, as sent by AWS CLI v2 >= 2.23
+	payload := "5\r\nhello\r\n6\r\n world\r\n0\r\nx-amz-checksum-crc32:AAAAAA==\r\n\r\n"
+
+	buf, err := ioutil.ReadAll(newChunkedReader(strings.NewReader(payload)))
+	assert.Equal(t, nil, err)
+	assert.Equal(t, "hello world", string(buf))
+}
+
+func TestChunkedUploadSignedTrailer(t *testing.T) {
+	sig := strings.Repeat("a", 64)
+	payload := "5;chunk-signature=" + sig + "\r\nhello\r\n0;chunk-signature=" + sig + "\r\n" +
+		"x-amz-checksum-crc32:AAAAAA==\r\nx-amz-trailer-signature:" + sig + "\r\n\r\n"
+
+	buf, err := ioutil.ReadAll(newChunkedReader(strings.NewReader(payload)))
+	assert.Equal(t, nil, err)
+	assert.Equal(t, "hello", string(buf))
 }

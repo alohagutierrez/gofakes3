@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1573,5 +1574,33 @@ func TestHeadObjectRangeStatusCode(t *testing.T) {
 	}
 	if normalHeader.Get("Content-Length") != "5" {
 		t.Fatal("unexpected content length", normalHeader.Get("Content-Length"))
+	}
+}
+
+// Uploads an aws-chunked body with a checksum trailer, like AWS CLI v2 >= 2.23
+// does by default, and checks the stored object contains only the payload.
+func TestPutObjectAWSChunkedTrailer(t *testing.T) {
+	ts := newTestServer(t)
+	defer ts.Close()
+
+	body := `{"data":{"root":[` + strings.Repeat(`{"code":"u-tees","children":[]},`, 300) + `{}]}}`
+	payload := fmt.Sprintf("%X\r\n%s\r\n0\r\nx-amz-checksum-crc64nvme:zSJRQ766llQ=\r\n\r\n", len(body), body)
+
+	req, err := http.NewRequest("PUT", ts.url("/"+defaultBucket+"/data.json"), strings.NewReader(payload))
+	ts.OK(err)
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+	req.Header.Set("X-Amz-Trailer", "x-amz-checksum-crc64nvme")
+	req.Header.Set("X-Amz-Decoded-Content-Length", strconv.Itoa(len(body)))
+
+	res, err := http.DefaultClient.Do(req)
+	ts.OK(err)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", res.StatusCode)
+	}
+
+	if got := ts.backendGetString(defaultBucket, "data.json", nil); got != body {
+		t.Fatalf("stored object differs from payload (len %d vs %d)", len(got), len(body))
 	}
 }
