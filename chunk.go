@@ -56,8 +56,6 @@ type chunkedReader struct {
 const crc64NVMEPoly = 0xad93d23594c93659
 
 var (
-	// The algorithm is reflected (refin/refout), and hash/crc64 expects the
-	// reflected form of the polynomial.
 	crc64NVMETable = crc64.MakeTable(bits.Reverse64(crc64NVMEPoly))
 	crc32cTable    = crc32.MakeTable(crc32.Castagnoli)
 )
@@ -81,8 +79,8 @@ func newChecksumHash(trailerName string) hash.Hash {
 // verifyTrailer enables checking of the checksum trailers named in the value
 // of the X-Amz-Trailer header (comma separated). Names that are not a
 // supported checksum, such as x-amz-trailer-signature, are ignored.
-func (r *chunkedReader) verifyTrailer(declared string) *chunkedReader {
-	for _, name := range strings.Split(declared, ",") {
+func (r *chunkedReader) verifyTrailer(trailerHeader string) *chunkedReader {
+	for _, name := range strings.Split(trailerHeader, ",") {
 		name = strings.ToLower(strings.TrimSpace(name))
 		if h := newChecksumHash(name); h != nil {
 			if r.checksums == nil {
@@ -221,8 +219,8 @@ func (r *chunkedReader) skipTrailers() error {
 
 // checkTrailerLine compares a "name:value" trailer line against the checksum
 // computed over the decoded data, if one is being tracked for that name.
-func (r *chunkedReader) checkTrailerLine(line string) error {
-	name, value, ok := strings.Cut(strings.TrimSpace(line), ":")
+func (r *chunkedReader) checkTrailerLine(trailer string) error {
+	name, value, ok := strings.Cut(strings.TrimSpace(trailer), ":")
 	if !ok {
 		return nil
 	}
