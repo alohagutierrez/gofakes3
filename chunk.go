@@ -10,6 +10,7 @@ import (
 	"hash/crc32"
 	"hash/crc64"
 	"io"
+	"math/bits"
 	"strings"
 )
 
@@ -48,8 +49,16 @@ type chunkedReader struct {
 	checksums map[string]hash.Hash
 }
 
+// crc64NVMEPoly is the CRC-64/NVME polynomial as published in the NVM Express
+// NVM Command Set Specification (section 5.2.1.3.4), which S3 uses for its
+// default CRC64NVME checksum. See
+// https://reveng.sourceforge.io/crc-catalogue/17plus.htm (CRC-64/NVME).
+const crc64NVMEPoly = 0xad93d23594c93659
+
 var (
-	crc64NVMETable = crc64.MakeTable(0x9a6c9329ac4bc9b5) // bit-reversed 0xAD93D23594C93659
+	// The algorithm is reflected (refin/refout), and hash/crc64 expects the
+	// reflected form of the polynomial.
+	crc64NVMETable = crc64.MakeTable(bits.Reverse64(crc64NVMEPoly))
 	crc32cTable    = crc32.MakeTable(crc32.Castagnoli)
 )
 
