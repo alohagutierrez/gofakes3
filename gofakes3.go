@@ -723,7 +723,7 @@ func (g *GoFakeS3) createObject(bucket, object string, w http.ResponseWriter, r 
 	var reader io.Reader
 
 	if sha, ok := meta["X-Amz-Content-Sha256"]; ok && isStreamingPayload(sha) {
-		reader = newChunkedReader(r.Body)
+		reader = newChunkedReader(r.Body).verifyTrailer(meta["X-Amz-Trailer"])
 		size, err = strconv.ParseInt(meta["X-Amz-Decoded-Content-Length"], 10, 64)
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest) // XXX: no code for this, according to s3tests
@@ -970,7 +970,7 @@ func (g *GoFakeS3) putMultipartUploadPart(bucket, object string, uploadID Upload
 	uploadSize := r.ContentLength
 
 	if isStreamingPayload(r.Header.Get("X-Amz-Content-Sha256")) {
-		rdr = newChunkedReader(r.Body)
+		rdr = newChunkedReader(r.Body).verifyTrailer(r.Header.Get("X-Amz-Trailer"))
 		decoded, err := strconv.ParseInt(r.Header.Get("X-Amz-Decoded-Content-Length"), 10, 64)
 		if err != nil || decoded < 0 {
 			w.WriteHeader(http.StatusBadRequest)

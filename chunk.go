@@ -2,8 +2,15 @@ package gofakes3
 
 import (
 	"bufio"
+	"crypto/sha1"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
+	"hash"
+	"hash/crc32"
+	"hash/crc64"
 	"io"
+	"strings"
 )
 
 // isStreamingPayload reports whether the X-Amz-Content-Sha256 value announces
@@ -23,15 +30,59 @@ var errChunkHeader = errors.New("expected integer")
 
 // chunkedReader decodes an aws-chunked body:
 //
-//	hex-size[;chunk-signature=...]\r\n data \r\n ... 0[;chunk-signature=...]\r\n
-//	[trailer-name:value\r\n]* \r\n
+//		hex-size[;chunk-signature=...]\r\n data \r\n ... 0[;chunk-signature=...]\r\n
+//		[trailer-name:value\r\n]* \r\n
 //
-// Signatures and trailers are consumed but not verified.
+//	Checksum trailers (x-amz-checksum-*) are verified against the decoded data if the reader
+//	was told to expect them using verifyTrailer; ErrBadDigest is returned from the
+//	Read that reaches the end of the body if they do not match.
 type chunkedReader struct {
 	inner       *bufio.Reader
 	chunkRemain int
 	started     bool
 	done        bool
+	err         error
+
+	// checksums holds a hasher for each checksum announced in X-Amz-Trailer,
+	// keyed by lower-cased trailer name.
+	checksums map[string]hash.Hash
+}
+
+var (
+	crc64NVMETable = crc64.MakeTable(0x9a6c9329ac4bc9b5) // bit-reversed 0xAD93D23594C93659
+	crc32cTable    = crc32.MakeTable(crc32.Castagnoli)
+)
+
+func newChecksumHash(trailerName string) hash.Hash {
+	switch trailerName {
+	case "x-amz-checksum-crc32":
+		return crc32.NewIEEE()
+	case "x-amz-checksum-crc32c":
+		return crc32.New(crc32cTable)
+	case "x-amz-checksum-crc64nvme":
+		return crc64.New(crc64NVMETable)
+	case "x-amz-checksum-sha1":
+		return sha1.New()
+	case "x-amz-checksum-sha256":
+		return sha256.New()
+	}
+	return nil
+}
+
+// verifyTrailer enables checking of the checksum trailers named in the value
+// of the X-Amz-Trailer header (comma separated). Names that are not a
+// supported checksum, such as x-amz-trailer-signature, are ignored.
+func (r *chunkedReader) verifyTrailer(declared string) *chunkedReader {
+	for _, name := range strings.Split(declared, ",") {
+		name = strings.ToLower(strings.TrimSpace(name))
+		if h := newChecksumHash(name); h != nil {
+			if r.checksums == nil {
+				r.checksums = map[string]hash.Hash{}
+			}
+			r.checksums[name] = h
+		}
+	}
+	return r
 }
 
 func newChunkedReader(inner io.Reader) *chunkedReader {
@@ -39,6 +90,17 @@ func newChunkedReader(inner io.Reader) *chunkedReader {
 }
 
 func (r *chunkedReader) Read(p []byte) (n int, err error) {
+	if r.err != nil {
+		return 0, r.err
+	}
+	n, err = r.read(p)
+	if err != nil {
+		r.err = err
+	}
+	return n, err
+}
+
+func (r *chunkedReader) read(p []byte) (n int, err error) {
 	for n < len(p) {
 		if r.done {
 			return n, io.EOF
@@ -49,6 +111,9 @@ func (r *chunkedReader) Read(p []byte) (n int, err error) {
 				sizeToRead = r.chunkRemain
 			}
 			innerN, err := r.inner.Read(p[n : n+sizeToRead])
+			for _, h := range r.checksums {
+				h.Write(p[n : n+innerN])
+			}
 			r.chunkRemain -= innerN
 			n += innerN
 			if err != nil {
@@ -127,6 +192,9 @@ func (r *chunkedReader) readChunkHeader() (int, error) {
 func (r *chunkedReader) skipTrailers() error {
 	for {
 		line, err := r.inner.ReadString('\n')
+		if cerr := r.checkTrailerLine(line); cerr != nil {
+			return cerr
+		}
 		if len(line) <= 2 { // "\r\n", "\n" or empty
 			if err == io.EOF {
 				return nil
@@ -140,4 +208,21 @@ func (r *chunkedReader) skipTrailers() error {
 			return err
 		}
 	}
+}
+
+// checkTrailerLine compares a "name:value" trailer line against the checksum
+// computed over the decoded data, if one is being tracked for that name.
+func (r *chunkedReader) checkTrailerLine(line string) error {
+	name, value, ok := strings.Cut(strings.TrimSpace(line), ":")
+	if !ok {
+		return nil
+	}
+	h, ok := r.checksums[strings.ToLower(strings.TrimSpace(name))]
+	if !ok {
+		return nil
+	}
+	if base64.StdEncoding.EncodeToString(h.Sum(nil)) != strings.TrimSpace(value) {
+		return ErrBadDigest
+	}
+	return nil
 }

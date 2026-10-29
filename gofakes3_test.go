@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"encoding/base64"
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"hash/crc64"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -1584,17 +1586,7 @@ func TestPutObjectAWSChunkedTrailer(t *testing.T) {
 	defer ts.Close()
 
 	body := `{"data":{"root":[` + strings.Repeat(`{"code":"u-tees","children":[]},`, 300) + `{}]}}`
-	payload := fmt.Sprintf("%X\r\n%s\r\n0\r\nx-amz-checksum-crc64nvme:zSJRQ766llQ=\r\n\r\n", len(body), body)
-
-	req, err := http.NewRequest("PUT", ts.url("/"+defaultBucket+"/data.json"), strings.NewReader(payload))
-	ts.OK(err)
-	req.Header.Set("Content-Encoding", "aws-chunked")
-	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
-	req.Header.Set("X-Amz-Trailer", "x-amz-checksum-crc64nvme")
-	req.Header.Set("X-Amz-Decoded-Content-Length", strconv.Itoa(len(body)))
-
-	res, err := http.DefaultClient.Do(req)
-	ts.OK(err)
+	res := putAWSChunked(ts, body, body, "x-amz-checksum-crc64nvme", crc64NVMEBase64(body))
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", res.StatusCode)
@@ -1603,4 +1595,57 @@ func TestPutObjectAWSChunkedTrailer(t *testing.T) {
 	if got := ts.backendGetString(defaultBucket, "data.json", nil); got != body {
 		t.Fatalf("stored object differs from payload (len %d vs %d)", len(got), len(body))
 	}
+}
+
+// The checksum in the trailer is checked against the decoded payload.
+func TestPutObjectAWSChunkedTrailerBadChecksum(t *testing.T) {
+	ts := newTestServer(t)
+	defer ts.Close()
+
+	body := "hello world"
+	res := putAWSChunked(ts, body, body, "x-amz-checksum-crc64nvme", crc64NVMEBase64("something else"))
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", res.StatusCode)
+	}
+	if obj, _ := ts.backend.GetObject(defaultBucket, "data.json", nil); obj != nil {
+		t.Fatal("object should not have been stored")
+	}
+}
+
+// The decoded length must match X-Amz-Decoded-Content-Length.
+func TestPutObjectAWSChunkedTrailerBadLength(t *testing.T) {
+	ts := newTestServer(t)
+	defer ts.Close()
+
+	body := "hello world"
+	res := putAWSChunked(ts, body, body+"!", "x-amz-checksum-crc64nvme", crc64NVMEBase64(body))
+	defer res.Body.Close()
+	if res.StatusCode == http.StatusOK {
+		t.Fatal("expected failure for length mismatch")
+	}
+}
+
+func crc64NVMEBase64(s string) string {
+	h := crc64.New(crc64.MakeTable(0x9a6c9329ac4bc9b5))
+	h.Write([]byte(s))
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+// putAWSChunked sends body as STREAMING-UNSIGNED-PAYLOAD-TRAILER, announcing
+// decoded as its decoded length.
+func putAWSChunked(ts *testServer, body, decoded, trailer, trailerValue string) *http.Response {
+	ts.Helper()
+	payload := fmt.Sprintf("%X\r\n%s\r\n0\r\n%s:%s\r\n\r\n", len(body), body, trailer, trailerValue)
+
+	req, err := http.NewRequest("PUT", ts.url("/"+defaultBucket+"/data.json"), strings.NewReader(payload))
+	ts.OK(err)
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+	req.Header.Set("X-Amz-Trailer", trailer)
+	req.Header.Set("X-Amz-Decoded-Content-Length", strconv.Itoa(len(decoded)))
+
+	res, err := http.DefaultClient.Do(req)
+	ts.OK(err)
+	return res
 }
